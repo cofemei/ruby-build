@@ -14,6 +14,17 @@
 #   -k, --keep      Do not remove source tree after installation
 #   -4, --ipv4      Resolve names to IPv4 addresses only
 #   -6, --ipv6      Resolve names to IPv6 addresses only
+#   -O, --optimize  Enable CachyOS-style CPU optimizations (auto-detect -march)
+#   -S, --static    Build static binary (no shared libraries)
+#   --detect-march  Detect and print optimal -march for this CPU, then exit
+#
+# Optimization environment variables (CachyOS-style):
+#   RUBY_BUILD_OPTIMIZE=1   Enable auto CPU optimization
+#   RUBY_BUILD_MARCH=...    Set -march (native, x86-64-v3, x86-64-v4, znver4, etc.)
+#   RUBY_BUILD_MTUNE=...    Set -mtune (default: same as march)
+#   RUBY_BUILD_OPT=...      Optimization level (0,1,2,3,s,fast) - default: 3
+#   RUBY_BUILD_LTO=...      Link Time Optimization (thin, full, or 1 for auto)
+#   RUBY_BUILD_STATIC=1     Build static binary (--disable-shared)
 #
 
 RUBY_BUILD_VERSION="20260114"
@@ -265,6 +276,72 @@ num_cpu_cores() {
     ;;
   esac
   echo "${num:-2}"
+}
+
+# CachyOS-style CPU architecture detection
+detect_cpu_march() {
+  [ -n "$RUBY_BUILD_MARCH" ] && { echo "$RUBY_BUILD_MARCH"; return; }
+  [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ] || return 1
+
+  local flags vendor cpu_family model
+  flags="$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2)" || return 1
+  vendor="$(grep -m1 '^vendor_id' /proc/cpuinfo | cut -d: -f2 | tr -d ' ')"
+  cpu_family="$(grep -m1 '^cpu family' /proc/cpuinfo | cut -d: -f2 | tr -d ' ')"
+  model="$(grep -m1 '^model[^_]' /proc/cpuinfo | cut -d: -f2 | tr -d ' ')"
+
+  # AMD Zen
+  if [ "$vendor" = "AuthenticAMD" ]; then
+    case "$cpu_family" in
+      23) echo "znver2"; return ;;
+      25) [ "$model" -ge 96 ] 2>/dev/null && echo "znver4" || echo "znver3"; return ;;
+      26) echo "znver5"; return ;;
+    esac
+  fi
+
+  # x86-64 feature levels (skip AVX-512 on Intel hybrid)
+  if [[ " $flags " == *" avx512f "* ]] && ! { [ "$vendor" = "GenuineIntel" ] && [[ " $flags " == *" hybrid "* ]]; }; then
+    echo "x86-64-v4"; return
+  fi
+  if [[ " $flags " == *" avx2 "* && " $flags " == *" bmi2 "* && " $flags " == *" fma "* ]]; then
+    echo "x86-64-v3"; return
+  fi
+  if [[ " $flags " == *" sse4_2 "* && " $flags " == *" popcnt "* ]]; then
+    echo "x86-64-v2"; return
+  fi
+  return 1
+}
+
+# Get optimized CFLAGS
+get_optimized_cflags() {
+  local march cflags="-O${RUBY_BUILD_OPT:-3}"
+  march="$(detect_cpu_march 2>/dev/null || true)"
+  if [ -n "$march" ]; then
+    cflags="$cflags -march=$march"
+    [[ "$march" == x86-64-v* ]] && cflags="$cflags -mtune=generic" || cflags="$cflags -mtune=$march"
+    echo "ruby-build: using -march=$march" >&2
+  fi
+  [ -n "$RUBY_BUILD_MTUNE" ] && cflags="$cflags -mtune=$RUBY_BUILD_MTUNE"
+  echo "$cflags -pipe"
+}
+
+# Get LTO flags
+get_lto_flags() {
+  case "$RUBY_BUILD_LTO" in
+    thin) echo "-flto=thin"; echo "ruby-build: using LTO=thin" >&2 ;;
+    full|1|yes|true) echo "-flto"; echo "ruby-build: using LTO=full" >&2 ;;
+  esac
+}
+
+# Show CPU detection info
+detect_march_info() {
+  local march flags
+  flags="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | cut -d: -f2)"
+  echo "CPU: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')"
+  echo "Arch: $(uname -m)"
+  echo "AVX2: $([[ " $flags " == *" avx2 "* ]] && echo yes || echo no)"
+  echo "AVX-512: $([[ " $flags " == *" avx512f "* ]] && echo yes || echo no)"
+  march="$(detect_cpu_march 2>/dev/null || true)"
+  echo "Recommended: ${march:-baseline x86-64}"
 }
 
 install_package() {
@@ -715,7 +792,16 @@ build_package_standard() {
     fi
   fi
 
-  ( if [ "${CFLAGS+defined}" ] || [ "${!PACKAGE_CFLAGS+defined}" ]; then
+  ( # CachyOS-style optimizations
+    if [ -n "$RUBY_BUILD_OPTIMIZE" ] || [ -n "$RUBY_BUILD_MARCH" ] || [ -n "$RUBY_BUILD_LTO" ]; then
+      local opt_cflags lto_flags
+      opt_cflags="$(get_optimized_cflags)"
+      lto_flags="$(get_lto_flags)"
+      [ -n "$opt_cflags" ] && export CFLAGS="${opt_cflags} ${CFLAGS:-}"
+      [ -n "$lto_flags" ] && export CFLAGS="$CFLAGS $lto_flags" CXXFLAGS="${CXXFLAGS:-} $lto_flags" LDFLAGS="$lto_flags ${LDFLAGS:-}"
+    fi
+
+    if [ "${CFLAGS+defined}" ] || [ "${!PACKAGE_CFLAGS+defined}" ]; then
       export CFLAGS="$CFLAGS ${!PACKAGE_CFLAGS}"
     fi
     if [ -z "$CC" ] && is_mac 1010; then
@@ -1309,7 +1395,11 @@ build_package_ldflags_dirs() {
 }
 
 build_package_enable_shared() {
-  if [[ " ${RUBY_CONFIGURE_OPTS} ${RUBY_CONFIGURE_OPTS_ARRAY[*]}" != *" --disable-shared"* ]]; then
+  # Support RUBY_BUILD_STATIC for static binary builds
+  if [ -n "$RUBY_BUILD_STATIC" ]; then
+    package_option ruby configure --disable-shared
+    echo "ruby-build: building static binary (--disable-shared)" >&2
+  elif [[ " ${RUBY_CONFIGURE_OPTS} ${RUBY_CONFIGURE_OPTS_ARRAY[*]}" != *" --disable-shared"* ]]; then
     package_option ruby configure --enable-shared
   fi
 }
@@ -1443,6 +1533,17 @@ for option in "${OPTIONS[@]}"; do
   "6" | "ipv6")
     IPV6=true
     ;;
+  "O" | "optimize")
+    RUBY_BUILD_OPTIMIZE=true
+    export RUBY_BUILD_OPTIMIZE
+    ;;
+  "S" | "static")
+    RUBY_BUILD_STATIC=true
+    export RUBY_BUILD_STATIC
+    ;;
+  "detect-march")
+    EARLY_EXIT=detect_march_info
+    ;;
   "version" )
     EARLY_EXIT=version
     ;;
@@ -1489,7 +1590,7 @@ help )
   echo
   usage 0
   ;;
-version | list_definitions | list_maintained_versions )
+version | list_definitions | list_maintained_versions | detect_march_info )
   "$EARLY_EXIT"
   exit 0
   ;;
