@@ -27,7 +27,7 @@
 #   RUBY_BUILD_STATIC=1     Build static binary (--disable-shared)
 #
 
-RUBY_BUILD_VERSION="20260114"
+RUBY_BUILD_VERSION="20260121"
 
 OLDIFS="$IFS"
 
